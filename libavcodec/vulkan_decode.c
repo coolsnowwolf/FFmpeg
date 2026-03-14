@@ -24,6 +24,8 @@
 #include "libavutil/mem.h"
 #include "libavutil/vulkan_loader.h"
 
+#define DECODER_IS_SDR(codec_id) (!get_codecdesc(codec_id)->decode_op)
+
 #if CONFIG_H264_VULKAN_HWACCEL
 extern const FFVulkanDecodeDescriptor ff_vk_dec_h264_desc;
 #endif
@@ -64,6 +66,9 @@ static const VkVideoProfileInfoKHR *get_video_profile(FFVulkanDecodeShared *ctx,
         codec_id == AV_CODEC_ID_HEVC ? VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_PROFILE_INFO_KHR :
         codec_id == AV_CODEC_ID_AV1  ? VK_STRUCTURE_TYPE_VIDEO_DECODE_AV1_PROFILE_INFO_KHR :
         0;
+
+    if (!profile_struct_type)
+        return NULL;
 
     profile_list = ff_vk_find_struct(ctx->s.hwfc->create_pnext,
                                      VK_STRUCTURE_TYPE_VIDEO_PROFILE_LIST_INFO_KHR);
@@ -242,9 +247,15 @@ int ff_vk_decode_add_slice(AVCodecContext *avctx, FFVulkanDecodePicture *vp,
         buf_size = 2 << av_log2(buf_size);
 
         err = ff_vk_get_pooled_buffer(&ctx->s, &ctx->buf_pool, &new_ref,
+                                      DECODER_IS_SDR(avctx->codec_id) ?
+                                      (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                       VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) :
                                       VK_BUFFER_USAGE_VIDEO_DECODE_SRC_BIT_KHR,
-                                      ctx->s.hwfc->create_pnext, buf_size,
-                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+                                      DECODER_IS_SDR(avctx->codec_id) ? NULL : ctx->s.hwfc->create_pnext,
+                                      buf_size,
+                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      (DECODER_IS_SDR(avctx->codec_id) ?
+                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0));
         if (err < 0)
             return err;
 
@@ -277,6 +288,9 @@ void ff_vk_decode_flush(AVCodecContext *avctx)
 {
     FFVulkanDecodeContext *dec = avctx->internal->hwaccel_priv_data;
     FFVulkanDecodeShared *ctx = dec->shared_ctx;
+
+    if (DECODER_IS_SDR(avctx->codec_id))
+        return;
 
     FFVulkanFunctions *vk = &ctx->s.vkfn;
     VkVideoBeginCodingInfoKHR decode_start = {
@@ -596,6 +610,7 @@ static void free_common(FFRefStructOpaque unused, void *obj)
 static int vulkan_decode_bootstrap(AVCodecContext *avctx, AVBufferRef *frames_ref)
 {
     int err;
+    const FFVulkanDecodeDescriptor *vk_desc = get_codecdesc(avctx->codec_id);
     FFVulkanDecodeContext *dec = avctx->internal->hwaccel_priv_data;
     AVHWFramesContext *frames = (AVHWFramesContext *)frames_ref->data;
     AVHWDeviceContext *device = (AVHWDeviceContext *)frames->device_ref->data;
@@ -615,7 +630,8 @@ static int vulkan_decode_bootstrap(AVCodecContext *avctx, AVBufferRef *frames_re
     ctx->s.extensions = ff_vk_extensions_to_mask(hwctx->enabled_dev_extensions,
                                                  hwctx->nb_enabled_dev_extensions);
 
-    if (!(ctx->s.extensions & FF_VK_EXT_VIDEO_DECODE_QUEUE)) {
+    if ((vk_desc->queue_flags & VK_QUEUE_VIDEO_DECODE_BIT_KHR) &&
+        !(ctx->s.extensions & FF_VK_EXT_VIDEO_DECODE_QUEUE)) {
         av_log(avctx, AV_LOG_ERROR, "Device does not support the %s extension!\n",
                VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME);
         ff_refstruct_unref(&dec->shared_ctx);
@@ -987,6 +1003,27 @@ int ff_vk_frame_params(AVCodecContext *avctx, AVBufferRef *hw_frames_ctx)
     if (err < 0)
         return err;
 
+    if (DECODER_IS_SDR(avctx->codec_id)) {
+        const VkFormat *fmts;
+
+        frames_ctx->sw_format = avctx->sw_pix_fmt;
+        fmts = av_vkfmt_from_pixfmt(frames_ctx->sw_format);
+        if (!fmts)
+            return AVERROR(EINVAL);
+
+        frames_ctx->width  = avctx->coded_width;
+        frames_ctx->height = avctx->coded_height;
+        frames_ctx->format = AV_PIX_FMT_VULKAN;
+
+        hwfc->format[0] = fmts[0];
+        hwfc->tiling    = VK_IMAGE_TILING_OPTIMAL;
+        hwfc->usage     = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                          VK_IMAGE_USAGE_STORAGE_BIT      |
+                          VK_IMAGE_USAGE_SAMPLED_BIT;
+
+        return 0;
+    }
+
     prof = av_mallocz(sizeof(FFVulkanDecodeProfileData));
     if (!prof)
         return AVERROR(ENOMEM);
@@ -1126,14 +1163,16 @@ int ff_vk_decode_init(AVCodecContext *avctx)
         return err;
 
     profile = get_video_profile(ctx, avctx->codec_id);
-    if (!profile) {
+    if (!DECODER_IS_SDR(avctx->codec_id) && !profile) {
         av_log(avctx, AV_LOG_ERROR, "Video profile missing from frames context!");
         return AVERROR(EINVAL);
     }
 
     /* Create queue context */
     vk_desc = get_codecdesc(avctx->codec_id);
-    err = ff_vk_video_qf_init(s, &ctx->qf,
+    err = DECODER_IS_SDR(avctx->codec_id) ?
+          ff_vk_qf_init(s, &ctx->qf, vk_desc->queue_flags) :
+          ff_vk_video_qf_init(s, &ctx->qf,
                               VK_QUEUE_VIDEO_DECODE_BIT_KHR,
                               vk_desc->decode_op);
     if (err < 0) {
@@ -1143,7 +1182,8 @@ int ff_vk_decode_init(AVCodecContext *avctx)
     }
 
     /* Enable queries if supported */
-    if (s->query_props[ctx->qf.queue_family].queryResultStatusSupport)
+    if (!DECODER_IS_SDR(avctx->codec_id) &&
+        s->query_props[ctx->qf.queue_family].queryResultStatusSupport)
         nb_q = 1;
 
     session_create.flags = 0x0;
@@ -1159,18 +1199,24 @@ int ff_vk_decode_init(AVCodecContext *avctx)
     /* Create decode exec context for this specific main thread.
      * 2 async contexts per thread was experimentally determined to be optimal
      * for a majority of streams. */
-    err = ff_vk_exec_pool_init(s, &ctx->qf, &dec->exec_pool, 2,
+    err = ff_vk_exec_pool_init(s, &ctx->qf, &dec->exec_pool,
+                               DECODER_IS_SDR(avctx->codec_id) ? FFMAX(2, ctx->qf.nb_queues) : 2,
                                nb_q, VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR, 0,
                                profile);
     if (err < 0)
         goto fail;
 
-    err = ff_vk_video_common_init(avctx, s, &ctx->common, &session_create);
-    if (err < 0)
-        goto fail;
+    if (!DECODER_IS_SDR(avctx->codec_id)) {
+        err = ff_vk_video_common_init(avctx, s, &ctx->common, &session_create);
+        if (err < 0)
+            goto fail;
+    } else {
+        ctx->caps.minBitstreamBufferSizeAlignment = AV_INPUT_BUFFER_PADDING_SIZE;
+    }
 
     /* If doing an out-of-place decoding, create a DPB pool */
-    if (dec->dedicated_dpb || avctx->codec_id == AV_CODEC_ID_AV1) {
+    if (!DECODER_IS_SDR(avctx->codec_id) &&
+        (dec->dedicated_dpb || avctx->codec_id == AV_CODEC_ID_AV1)) {
         AVHWFramesContext *dpb_frames;
         AVVulkanFramesContext *dpb_hwfc;
 
@@ -1218,13 +1264,15 @@ int ff_vk_decode_init(AVCodecContext *avctx)
         }
     }
 
-    session_params_create.videoSession = ctx->common.session;
-    ret = vk->CreateVideoSessionParametersKHR(s->hwctx->act_dev, &session_params_create,
-                                              s->hwctx->alloc, &ctx->empty_session_params);
-    if (ret != VK_SUCCESS) {
-        av_log(avctx, AV_LOG_ERROR, "Unable to create empty Vulkan video session parameters: %s!\n",
-               ff_vk_ret2str(ret));
-        return AVERROR_EXTERNAL;
+    if (!DECODER_IS_SDR(avctx->codec_id)) {
+        session_params_create.videoSession = ctx->common.session;
+        ret = vk->CreateVideoSessionParametersKHR(s->hwctx->act_dev, &session_params_create,
+                                                  s->hwctx->alloc, &ctx->empty_session_params);
+        if (ret != VK_SUCCESS) {
+            av_log(avctx, AV_LOG_ERROR, "Unable to create empty Vulkan video session parameters: %s!\n",
+                   ff_vk_ret2str(ret));
+            return AVERROR_EXTERNAL;
+        }
     }
 
     driver_props = &dec->shared_ctx->s.driver_props;
