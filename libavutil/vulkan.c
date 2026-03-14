@@ -1263,6 +1263,82 @@ const char *ff_vk_shader_rep_fmt(enum AVPixelFormat pixfmt)
     return high ? "rgba16f" : "rgba8";
 }
 
+static VkImageAspectFlags vk_aspect_flag(AVFrame *f, int plane)
+{
+    AVVkFrame *vkf = (AVVkFrame *)f->data[0];
+    AVHWFramesContext *hwfc = (AVHWFramesContext *)f->hw_frames_ctx->data;
+    const int nb_images = ff_vk_count_images(vkf);
+    const int nb_planes = av_pix_fmt_count_planes(hwfc->sw_format);
+
+    static const VkImageAspectFlags plane_aspect[] = {
+        VK_IMAGE_ASPECT_PLANE_0_BIT,
+        VK_IMAGE_ASPECT_PLANE_1_BIT,
+        VK_IMAGE_ASPECT_PLANE_2_BIT,
+    };
+
+    if (ff_vk_mt_is_np_rgb(hwfc->sw_format) || (nb_planes == nb_images))
+        return VK_IMAGE_ASPECT_COLOR_BIT;
+
+    return plane_aspect[plane];
+}
+
+static VkFormat map_fmt_to_rep(VkFormat fmt, enum FFVkShaderRepFormat rep_fmt)
+{
+#define REPS_FMT(fmt) \
+    [FF_VK_REP_NATIVE] = fmt ## _UINT, \
+    [FF_VK_REP_FLOAT]  = fmt ## _UNORM, \
+    [FF_VK_REP_INT]    = fmt ## _SINT, \
+    [FF_VK_REP_UINT]   = fmt ## _UINT,
+
+#define REPS_FMT_PACK(fmt, num) \
+    [FF_VK_REP_NATIVE] = fmt ## _UINT_PACK ## num, \
+    [FF_VK_REP_FLOAT]  = fmt ## _UNORM_PACK ## num, \
+    [FF_VK_REP_INT]    = fmt ## _SINT_PACK ## num, \
+    [FF_VK_REP_UINT]   = fmt ## _UINT_PACK ## num,
+
+    const VkFormat fmts_map[][4] = {
+        { REPS_FMT_PACK(VK_FORMAT_A2B10G10R10, 32) },
+        { REPS_FMT_PACK(VK_FORMAT_A2R10G10B10, 32) },
+        { REPS_FMT(VK_FORMAT_B8G8R8) },
+        { REPS_FMT(VK_FORMAT_B8G8R8A8) },
+        { REPS_FMT(VK_FORMAT_R8) },
+        { REPS_FMT(VK_FORMAT_R8G8) },
+        { REPS_FMT(VK_FORMAT_R8G8B8) },
+        { REPS_FMT(VK_FORMAT_R8G8B8A8) },
+        { REPS_FMT(VK_FORMAT_R16) },
+        { REPS_FMT(VK_FORMAT_R16G16) },
+        { REPS_FMT(VK_FORMAT_R16G16B16) },
+        { REPS_FMT(VK_FORMAT_R16G16B16A16) },
+        {
+            VK_FORMAT_R32_UINT,
+            VK_FORMAT_R32_SFLOAT,
+            VK_FORMAT_R32_SINT,
+            VK_FORMAT_R32_UINT,
+        },
+        {
+            VK_FORMAT_R32G32B32A32_SFLOAT,
+            VK_FORMAT_R32G32B32A32_SFLOAT,
+            VK_FORMAT_UNDEFINED,
+            VK_FORMAT_UNDEFINED,
+        },
+    };
+#undef REPS_FMT_PACK
+#undef REPS_FMT
+
+    if (fmt == VK_FORMAT_UNDEFINED)
+        return VK_FORMAT_UNDEFINED;
+
+    for (int i = 0; i < FF_ARRAY_ELEMS(fmts_map); i++) {
+        if (fmts_map[i][FF_VK_REP_NATIVE] == fmt ||
+            fmts_map[i][FF_VK_REP_FLOAT] == fmt ||
+            fmts_map[i][FF_VK_REP_INT] == fmt ||
+            fmts_map[i][FF_VK_REP_UINT] == fmt)
+            return fmts_map[i][rep_fmt];
+    }
+
+    return VK_FORMAT_UNDEFINED;
+}
+
 typedef struct ImageViewCtx {
     int nb_views;
     VkImageView views[];
@@ -1278,6 +1354,49 @@ static void destroy_imageviews(void *opaque, uint8_t *data)
         vk->DestroyImageView(s->hwctx->act_dev, iv->views[i], s->hwctx->alloc);
 
     av_free(iv);
+}
+
+int ff_vk_create_imageview(FFVulkanContext *s,
+                           VkImageView *img_view, VkImageAspectFlags *aspect,
+                           AVFrame *f, int plane, enum FFVkShaderRepFormat rep_fmt)
+{
+    VkResult ret;
+    FFVulkanFunctions *vk = &s->vkfn;
+    AVHWFramesContext *hwfc = (AVHWFramesContext *)f->hw_frames_ctx->data;
+    const VkFormat *rep_fmts = av_vkfmt_from_pixfmt(hwfc->sw_format);
+    AVVkFrame *vkf = (AVVkFrame *)f->data[0];
+    const int nb_images = ff_vk_count_images(vkf);
+
+    VkImageViewCreateInfo view_create_info = {
+        .sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext      = NULL,
+        .image      = vkf->img[FFMIN(plane, nb_images - 1)],
+        .viewType   = VK_IMAGE_VIEW_TYPE_2D,
+        .format     = map_fmt_to_rep(rep_fmts[plane], rep_fmt),
+        .components = ff_comp_identity_map,
+        .subresourceRange = {
+            .aspectMask = vk_aspect_flag(f, plane),
+            .levelCount = 1,
+            .layerCount = 1,
+        },
+    };
+    if (view_create_info.format == VK_FORMAT_UNDEFINED) {
+        av_log(s, AV_LOG_ERROR, "Unable to find a compatible representation of format %i and mode %i\n",
+               rep_fmts[plane], rep_fmt);
+        return AVERROR(EINVAL);
+    }
+
+    ret = vk->CreateImageView(s->hwctx->act_dev, &view_create_info,
+                              s->hwctx->alloc, img_view);
+    if (ret != VK_SUCCESS) {
+        av_log(s, AV_LOG_ERROR, "Failed to create imageview: %s\n",
+               ff_vk_ret2str(ret));
+        return AVERROR_EXTERNAL;
+    }
+
+    *aspect = view_create_info.subresourceRange.aspectMask;
+
+    return 0;
 }
 
 int ff_vk_create_imageviews(FFVulkanContext *s, FFVkExecContext *e,

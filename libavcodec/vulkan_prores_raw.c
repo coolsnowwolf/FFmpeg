@@ -90,7 +90,8 @@ static int vk_prores_raw_start_frame(AVCodecContext *avctx,
     if (err < 0)
         return err;
 
-    return ff_vk_decode_prepare_frame(dec, prr->frame, &pp->vp, 1, 0);
+    return ff_vk_decode_prepare_frame_sdr(dec, prr->frame, &pp->vp, 1,
+                                          FF_VK_REP_FLOAT, 0);
 }
 
 static int vk_prores_raw_decode_slice(AVCodecContext *avctx,

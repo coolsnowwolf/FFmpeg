@@ -213,6 +213,56 @@ int ff_vk_decode_prepare_frame(FFVulkanDecodeContext *dec, AVFrame *pic,
     return 0;
 }
 
+int ff_vk_decode_prepare_frame_sdr(FFVulkanDecodeContext *dec, AVFrame *pic,
+                                   FFVulkanDecodePicture *vkpic, int is_current,
+                                   enum FFVkShaderRepFormat rep_fmt, int alloc_dpb)
+{
+    int err;
+    FFVulkanDecodeShared *ctx = dec->shared_ctx;
+
+    vkpic->slices_size = 0;
+
+    if (vkpic->img_view_ref)
+        return 0;
+
+    vkpic->dpb_frame     = NULL;
+    vkpic->img_view_ref  = VK_NULL_HANDLE;
+    vkpic->img_view_out  = VK_NULL_HANDLE;
+    vkpic->img_view_dest = VK_NULL_HANDLE;
+
+    vkpic->destroy_image_view = ctx->s.vkfn.DestroyImageView;
+    vkpic->wait_semaphores = ctx->s.vkfn.WaitSemaphores;
+
+    if (alloc_dpb) {
+        vkpic->dpb_frame = vk_get_dpb_pool(ctx);
+        if (!vkpic->dpb_frame)
+            return AVERROR(ENOMEM);
+
+        err = ff_vk_create_imageview(&ctx->s,
+                                     &vkpic->img_view_ref, &vkpic->img_aspect_ref,
+                                     vkpic->dpb_frame, 0, rep_fmt);
+        if (err < 0)
+            return err;
+
+        vkpic->img_view_dest = vkpic->img_view_ref;
+    }
+
+    if (!alloc_dpb || is_current) {
+        err = ff_vk_create_imageview(&ctx->s,
+                                     &vkpic->img_view_out, &vkpic->img_aspect,
+                                     pic, 0, rep_fmt);
+        if (err < 0)
+            return err;
+
+        if (!alloc_dpb) {
+            vkpic->img_view_ref = vkpic->img_view_out;
+            vkpic->img_aspect_ref = vkpic->img_aspect;
+        }
+    }
+
+    return 0;
+}
+
 int ff_vk_decode_add_slice(AVCodecContext *avctx, FFVulkanDecodePicture *vp,
                            const uint8_t *data, size_t size, int add_startcode,
                            uint32_t *nb_slices, const uint32_t **offsets)
