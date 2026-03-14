@@ -1417,6 +1417,12 @@ int ff_vk_shader_init(FFVulkanPipeline *pl, FFVkSPIRVShader *shd, const char *na
     GLSLF(0, #version %i                                                  ,460);
     GLSLC(0, #define IS_WITHIN(v1, v2) ((v1.x < v2.x) && (v1.y < v2.y))       );
     GLSLC(0,                                                                  );
+    GLSLC(0, #extension GL_EXT_scalar_block_layout : require                  );
+    GLSLC(0, #extension GL_EXT_shader_explicit_arithmetic_types : require     );
+    GLSLC(0, #extension GL_EXT_control_flow_attributes : require              );
+    GLSLC(0, #extension GL_EXT_shader_image_load_formatted : require          );
+    GLSLC(0, #define assumeEXT(x) (x)                                         );
+    GLSLC(0, #define expectEXT(x, c) (x)                                      );
     GLSLC(0, #extension GL_EXT_buffer_reference : require                     );
     GLSLC(0, #extension GL_EXT_buffer_reference2 : require                    );
 
