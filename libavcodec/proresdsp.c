@@ -64,6 +64,15 @@ static void put_pixels_12(uint16_t *dst, ptrdiff_t linesize, const int16_t *in)
     put_pixel(dst, linesize, in, 12);
 }
 
+static inline void put_pixel_bayer_12(uint16_t *dst, ptrdiff_t linesize,
+                                      const int16_t *in)
+{
+    for (int y = 0; y < 8; y++, dst += linesize) {
+        for (int x = 0; x < 8; x++)
+            dst[x * 2] = CLIP_12(in[(y << 3) + x]) << 4;
+    }
+}
+
 static void prores_idct_put_10_c(uint16_t *out, ptrdiff_t linesize, int16_t *block, const int16_t *qmat)
 {
     ff_prores_idct_10(block, qmat);
@@ -76,6 +85,13 @@ static void prores_idct_put_12_c(uint16_t *out, ptrdiff_t linesize, int16_t *blo
     put_pixels_12(out, linesize >> 1, block);
 }
 
+static void prores_idct_put_bayer_12_c(uint16_t *out, ptrdiff_t linesize,
+                                       int16_t *block, const int16_t *qmat)
+{
+    ff_prores_idct_12(block, qmat);
+    put_pixel_bayer_12(out, linesize << 1, block);
+}
+
 av_cold int ff_proresdsp_init(ProresDSPContext *dsp, int bits_per_raw_sample)
 {
     if (bits_per_raw_sample == 10) {
@@ -83,6 +99,7 @@ av_cold int ff_proresdsp_init(ProresDSPContext *dsp, int bits_per_raw_sample)
         dsp->idct_permutation_type = FF_IDCT_PERM_NONE;
     } else if (bits_per_raw_sample == 12) {
         dsp->idct_put = prores_idct_put_12_c;
+        dsp->idct_put_bayer = prores_idct_put_bayer_12_c;
         dsp->idct_permutation_type = FF_IDCT_PERM_NONE;
     } else {
         return AVERROR_BUG;
