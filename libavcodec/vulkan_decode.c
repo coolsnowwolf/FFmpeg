@@ -232,11 +232,13 @@ int ff_vk_decode_add_slice(AVCodecContext *avctx, FFVulkanDecodePicture *vp,
     new_size = FFALIGN(new_size, ctx->caps.minBitstreamBufferSizeAlignment);
 
     slice_off = av_fast_realloc(dec->slice_off, &dec->slice_off_max,
-                                (nb + 1)*sizeof(slice_off));
+                                (nb + 1) * sizeof(*slice_off));
     if (!slice_off)
         return AVERROR(ENOMEM);
 
-    *offsets = dec->slice_off = slice_off;
+    dec->slice_off = slice_off;
+    if (offsets)
+        *offsets = slice_off;
     slice_off[nb] = vp->slices_size;
 
     vkbuf = vp->slices_buf ? (FFVkBuffer *)vp->slices_buf->data : NULL;

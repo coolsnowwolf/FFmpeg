@@ -67,56 +67,6 @@ typedef struct TileData {
     uint32_t size;
 } TileData;
 
-static int create_output_view(FFVulkanDecodeShared *ctx, AVFrame *frame,
-                              FFVulkanDecodePicture *vp)
-{
-    VkResult ret;
-    FFVulkanFunctions *vk = &ctx->s.vkfn;
-    AVHWFramesContext *frames = (AVHWFramesContext *)frame->hw_frames_ctx->data;
-    AVVulkanFramesContext *vkfc = frames->hwctx;
-    AVVkFrame *vkf = (AVVkFrame *)frame->data[0];
-    VkImageViewUsageCreateInfo usage_info = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-        .usage = vkfc->usage,
-    };
-    VkImageViewCreateInfo view_create_info = {
-        .sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .pNext      = &usage_info,
-        .image      = vkf->img[0],
-        .viewType   = VK_IMAGE_VIEW_TYPE_2D,
-        .format     = VK_FORMAT_R16_UNORM,
-        .components = ff_comp_identity_map,
-        .subresourceRange = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .levelCount = 1,
-            .layerCount = 1,
-        },
-    };
-
-    vp->slices_size = 0;
-    vp->dpb_frame = NULL;
-    vp->img_view_ref = VK_NULL_HANDLE;
-    vp->img_view_out = VK_NULL_HANDLE;
-    vp->img_view_dest = VK_NULL_HANDLE;
-    vp->destroy_image_view = vk->DestroyImageView;
-    vp->wait_semaphores = vk->WaitSemaphores;
-
-    ret = vk->CreateImageView(ctx->s.hwctx->act_dev, &view_create_info,
-                              ctx->s.hwctx->alloc, &vp->img_view_out);
-    if (ret != VK_SUCCESS) {
-        av_log(ctx, AV_LOG_ERROR, "Failed to create imageview: %s\n",
-               ff_vk_ret2str(ret));
-        return AVERROR_EXTERNAL;
-    }
-
-    vp->img_view_ref = vp->img_view_out;
-    vp->img_view_dest = vp->img_view_out;
-    vp->img_aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    vp->img_aspect_ref = VK_IMAGE_ASPECT_COLOR_BIT;
-
-    return 0;
-}
-
 static int vk_prores_raw_start_frame(AVCodecContext *avctx,
                                      const uint8_t *buffer,
                                      uint32_t size)
@@ -140,7 +90,7 @@ static int vk_prores_raw_start_frame(AVCodecContext *avctx,
     if (err < 0)
         return err;
 
-    return create_output_view(ctx, prr->frame, &pp->vp);
+    return ff_vk_decode_prepare_frame(dec, prr->frame, &pp->vp, 1, 0);
 }
 
 static int vk_prores_raw_decode_slice(AVCodecContext *avctx,
@@ -198,6 +148,8 @@ static int vk_prores_raw_end_frame(AVCodecContext *avctx)
     RET(ff_vk_exec_add_dep_frame(&ctx->s, exec, prr->frame,
                                  VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT));
+    RET(ff_vk_exec_mirror_sem_value(&ctx->s, exec, &vp->sem, &vp->sem_value,
+                                    prr->frame));
     RET(ff_vk_exec_add_dep_buf(&ctx->s, exec, &pp->tile_data, 1, 0));
     pp->tile_data = NULL;
     RET(ff_vk_exec_add_dep_buf(&ctx->s, exec, &vp->slices_buf, 1, 0));
