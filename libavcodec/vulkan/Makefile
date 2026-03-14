@@ -3,6 +3,9 @@ GEN_CLEANSUFFIXES = *.o *.c *.d
 clean::
 	$(RM) $(GEN_CLEANSUFFIXES:%=libavcodec/vulkan/%)
 
+OBJS-$(CONFIG_PRORES_RAW_VULKAN_HWACCEL) += vulkan/common.o \
+					    vulkan/prores_raw.o
+
 VULKAN = $(subst $(SRC_PATH)/,,$(wildcard $(SRC_PATH)/libavcodec/vulkan/*.comp))
 .SECONDARY: $(VULKAN:.comp=.c)
 libavcodec/vulkan/%.c: TAG = VULKAN

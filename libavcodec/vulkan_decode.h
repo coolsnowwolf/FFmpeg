@@ -55,6 +55,9 @@ typedef struct FFVulkanDecodeShared {
     VkVideoDecodeCapabilitiesKHR dec_caps;
 
     VkVideoSessionParametersKHR empty_session_params;
+
+    void *sd_ctx;
+    void (*sd_ctx_free)(struct FFVulkanDecodeShared *ctx);
 } FFVulkanDecodeShared;
 
 typedef struct FFVulkanDecodeContext {
