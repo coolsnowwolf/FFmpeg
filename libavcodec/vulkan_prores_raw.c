@@ -341,7 +341,6 @@ static void vk_decode_prores_raw_uninit(FFVulkanDecodeShared *ctx)
 static int vk_decode_prores_raw_init(AVCodecContext *avctx)
 {
     int err = 0;
-    const double pi = 3.14159265358979323846;
     ProResRAWContext *prr = avctx->priv_data;
     FFVulkanDecodeContext *dec = avctx->internal->hwaccel_priv_data;
     FFVulkanDecodeShared *ctx;
@@ -356,7 +355,16 @@ static int vk_decode_prores_raw_init(AVCodecContext *avctx)
     };
     size_t cb_offset[4];
     size_t ua;
-    double idct_8_scales[8];
+    double idct_8_scales[8] = {
+        cos(4.0*M_PI/16.0) / 2.0,
+        cos(1.0*M_PI/16.0) / 2.0,
+        cos(2.0*M_PI/16.0) / 2.0,
+        cos(3.0*M_PI/16.0) / 2.0,
+        cos(4.0*M_PI/16.0) / 2.0,
+        cos(5.0*M_PI/16.0) / 2.0,
+        cos(6.0*M_PI/16.0) / 2.0,
+        cos(7.0*M_PI/16.0) / 2.0,
+    };
 
     spv = ff_vk_spirv_init();
     if (!spv) {
@@ -395,9 +403,6 @@ static int vk_decode_prores_raw_init(AVCodecContext *avctx)
                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT));
     RET(ff_vk_map_buffer(&ctx->s, &prv->uniform_buf, &uniform_buf, 0));
-
-    for (int i = 0; i < 8; i++)
-        idct_8_scales[i] = cos(i*pi/16.0) / 2.0;
 
     for (int i = 0; i < 64; i++)
         ((float *)uniform_buf)[i] = (float)(idct_8_scales[i >> 3] *
