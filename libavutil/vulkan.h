@@ -335,6 +335,13 @@ int ff_vk_mt_is_np_rgb(enum AVPixelFormat pix_fmt);
 /**
  * Returns the format to use for images in shaders.
  */
+enum FFVkShaderRepFormat {
+    FF_VK_REP_NATIVE = 0,
+    FF_VK_REP_FLOAT,
+    FF_VK_REP_INT,
+    FF_VK_REP_UINT,
+};
+
 const char *ff_vk_shader_rep_fmt(enum AVPixelFormat pixfmt);
 
 /**
@@ -405,6 +412,13 @@ int ff_vk_exec_mirror_sem_value(FFVulkanContext *s, FFVkExecContext *e,
                                 VkSemaphore *dst, uint64_t *dst_val,
                                 AVFrame *f);
 void ff_vk_exec_discard_deps(FFVulkanContext *s, FFVkExecContext *e);
+
+/**
+ * Create a single imageview for a given plane and representation.
+ */
+int ff_vk_create_imageview(FFVulkanContext *s,
+                           VkImageView *img_view, VkImageAspectFlags *aspect,
+                           AVFrame *f, int plane, enum FFVkShaderRepFormat rep_fmt);
 
 /**
  * Create an imageview and add it as a dependency to an execution.
