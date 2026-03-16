@@ -221,10 +221,14 @@ static int glslc_shader_compile(FFVkSPIRVCompiler *ctx, void *avctx,
     if (messages)
         av_log(avctx, AV_LOG_WARNING, "%s\n", messages);
 
+#if ((GLSLANG_VERSION_MAJOR) >= 12)
     glslang_program_SPIRV_generate_with_options(glslc_program, glslc_input.stage,
                                                 &(glslang_spv_options_t) {
                                                     .generate_debug_info = true,
                                                 });
+#else
+    glslang_program_SPIRV_generate(glslc_program, glslc_input.stage);
+#endif
 
     *size = glslang_program_SPIRV_get_size(glslc_program) * sizeof(uint32_t);
     *data = av_malloc(*size);
