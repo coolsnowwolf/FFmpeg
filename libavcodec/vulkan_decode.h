@@ -48,6 +48,7 @@ typedef struct FFVulkanDecodeShared {
     FFVulkanContext s;
     FFVkVideoCommon common;
     FFVkQueueFamilyCtx qf;
+    FFVkExecPool exec_pool;
 
     AVBufferPool *buf_pool;
 
@@ -63,7 +64,6 @@ typedef struct FFVulkanDecodeShared {
 typedef struct FFVulkanDecodeContext {
     FFVulkanDecodeShared *shared_ctx;
     AVBufferRef *session_params;
-    FFVkExecPool exec_pool;
 
     int dedicated_dpb; /* Oddity  #1 - separate DPB images */
     int external_fg;   /* Oddity  #2 - hardware can't apply film grain */

@@ -143,7 +143,7 @@ static int vk_prores_raw_end_frame(AVCodecContext *avctx)
     tile_data = (FFVkBuffer *)pp->tile_data->data;
     pl = &prv->pl[prr->version];
 
-    exec = ff_vk_exec_get(&dec->exec_pool);
+    exec = ff_vk_exec_get(&ctx->s, &ctx->exec_pool);
     ff_vk_exec_start(&ctx->s, exec);
 
     RET(ff_vk_exec_add_dep_frame(&ctx->s, exec, prr->frame,
@@ -314,7 +314,7 @@ static int init_decode_shader(AVCodecContext *avctx, FFVkSPIRVCompiler *spv,
                             &spv_opaque));
     RET(ff_vk_shader_create(&ctx->s, shd, spv_data, spv_len, "main"));
     RET(ff_vk_init_compute_pipeline(&ctx->s, pl, shd));
-    RET(ff_vk_exec_pipeline_register(&ctx->s, &dec->exec_pool, pl));
+    RET(ff_vk_exec_pipeline_register(&ctx->s, &ctx->exec_pool, pl));
 
 fail:
     if (spv_opaque)
