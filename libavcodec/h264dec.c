@@ -668,7 +668,7 @@ static int decode_nal_units(H264Context *h, const uint8_t *buf, int buf_size)
                 }
 
                 if (h->avctx->hwaccel &&
-                    (ret = FF_HW_CALL(h->avctx, start_frame, buf, buf_size)) < 0)
+                    (ret = FF_HW_CALL(h->avctx, start_frame, NULL, buf, buf_size)) < 0)
                     goto end;
             }
 

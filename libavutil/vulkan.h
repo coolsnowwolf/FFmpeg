@@ -23,7 +23,6 @@
 
 #include <stdatomic.h>
 
-#include "thread.h"
 #include "pixdesc.h"
 #include "bprint.h"
 #include "hwcontext.h"
@@ -103,8 +102,16 @@ typedef struct FFVkBuffer {
     VkPipelineStageFlags2 stage;
     VkAccessFlags2 access;
 
-    /* Only valid when allocated via ff_vk_get_pooled_buffer with HOST_VISIBLE */
+    /* Only valid when allocated via ff_vk_get_pooled_buffer with HOST_VISIBLE or
+     * via ff_vk_host_map_buffer */
     uint8_t *mapped_mem;
+
+    /* Set by ff_vk_host_map_buffer. The address and mapped_mem fields are
+     * offset by this amount. */
+    size_t virtual_offset;
+
+    /* If host mapping, reference to the backing host memory buffer. */
+    AVBufferRef *host_ref;
 } FFVkBuffer;
 
 typedef struct FFVkQueueFamilyCtx {
@@ -115,7 +122,6 @@ typedef struct FFVkQueueFamilyCtx {
 typedef struct FFVkExecContext {
     uint32_t idx;
     const struct FFVkExecPool *parent;
-    pthread_mutex_t lock;
     int had_submission;
 
     /* Queue for the execution context */
@@ -172,9 +178,9 @@ typedef struct FFVkExecContext {
 
 typedef struct FFVkExecPool {
     FFVkExecContext *contexts;
-    atomic_int_least64_t idx;
+    atomic_uint_least64_t idx;
 
-    VkCommandPool cmd_buf_pool;
+    VkCommandPool *cmd_buf_pools;
     VkCommandBuffer *cmd_bufs;
     int pool_size;
 
@@ -369,7 +375,7 @@ void ff_vk_exec_pool_free(FFVulkanContext *s, FFVkExecPool *pool);
 /**
  * Retrieve an execution pool. Threadsafe.
  */
-FFVkExecContext *ff_vk_exec_get(FFVkExecPool *pool);
+FFVkExecContext *ff_vk_exec_get(FFVulkanContext *s, FFVkExecPool *pool);
 
 /**
  * Performs nb_queries queries and returns their results and statuses.
@@ -469,6 +475,10 @@ static inline int ff_vk_unmap_buffer(FFVulkanContext *s, FFVkBuffer *buf, int fl
 }
 
 void ff_vk_free_buf(FFVulkanContext *s, FFVkBuffer *buf);
+
+int ff_vk_host_map_buffer(FFVulkanContext *s, AVBufferRef **dst,
+                          uint8_t *src_data, const AVBufferRef *src_buf,
+                          VkBufferUsageFlags usage);
 
 /** Initialize a pool and create AVBufferRefs containing FFVkBuffer.
  * Threadsafe to use. Buffers are automatically mapped on creation if

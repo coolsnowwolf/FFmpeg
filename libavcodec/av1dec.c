@@ -1363,7 +1363,7 @@ static int av1_receive_frame_internal(AVCodecContext *avctx, AVFrame *frame)
             s->cur_frame.temporal_id = header->temporal_id;
 
             if (avctx->hwaccel && s->cur_frame.f) {
-                ret = FF_HW_CALL(avctx, start_frame, unit->data, unit->data_size);
+                ret = FF_HW_CALL(avctx, start_frame, NULL, unit->data, unit->data_size);
                 if (ret < 0) {
                     av_log(avctx, AV_LOG_ERROR, "HW accel start frame fail.\n");
                     goto end;

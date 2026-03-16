@@ -68,8 +68,9 @@ typedef struct TileData {
 } TileData;
 
 static int vk_prores_raw_start_frame(AVCodecContext *avctx,
-                                     const uint8_t *buffer,
-                                     uint32_t size)
+                                     const AVBufferRef *buffer_ref,
+                                     av_unused const uint8_t *buffer,
+                                     av_unused uint32_t size)
 {
     int err;
     FFVulkanDecodeContext *dec = avctx->internal->hwaccel_priv_data;
@@ -77,6 +78,15 @@ static int vk_prores_raw_start_frame(AVCodecContext *avctx,
     ProResRAWVulkanDecodeContext *prv = ctx->sd_ctx;
     ProResRAWContext *prr = avctx->priv_data;
     ProResRAWVulkanDecodePicture *pp = prr->hwaccel_picture_private;
+
+    if ((ctx->s.extensions & FF_VK_EXT_EXTERNAL_HOST_MEMORY) && buffer_ref) {
+        err = ff_vk_host_map_buffer(&ctx->s, &pp->vp.slices_buf, buffer_ref->data,
+                                    buffer_ref,
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        if (err < 0)
+            return err;
+    }
 
     pp->nb_tiles = 0;
 
@@ -98,21 +108,28 @@ static int vk_prores_raw_decode_slice(AVCodecContext *avctx,
                                       const uint8_t *data,
                                       uint32_t size)
 {
-    int err;
     ProResRAWContext *prr = avctx->priv_data;
     ProResRAWVulkanDecodePicture *pp = prr->hwaccel_picture_private;
     FFVulkanDecodePicture *vp = &pp->vp;
     FFVkBuffer *tile_data_buf = (FFVkBuffer *)pp->tile_data->data;
     TileData *td = (TileData *)tile_data_buf->mapped_mem;
+    FFVkBuffer *slices_buf = vp->slices_buf ? (FFVkBuffer *)vp->slices_buf->data : NULL;
 
     td[pp->nb_tiles].pos[0] = prr->tiles[pp->nb_tiles].x;
     td[pp->nb_tiles].pos[1] = prr->tiles[pp->nb_tiles].y;
     td[pp->nb_tiles].size = size;
-    td[pp->nb_tiles].offset = vp->slices_size;
 
-    err = ff_vk_decode_add_slice(avctx, vp, data, size, 0, &pp->nb_tiles, NULL);
-    if (err < 0)
-        return err;
+    if (vp->slices_buf && slices_buf->host_ref) {
+        td[pp->nb_tiles].offset = data - slices_buf->mapped_mem;
+        pp->nb_tiles++;
+    } else {
+        int err;
+
+        td[pp->nb_tiles].offset = vp->slices_size;
+        err = ff_vk_decode_add_slice(avctx, vp, data, size, 0, &pp->nb_tiles, NULL);
+        if (err < 0)
+            return err;
+    }
 
     return 0;
 }

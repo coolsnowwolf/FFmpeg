@@ -469,7 +469,7 @@ static int decode_frame(AVCodecContext *avctx,
         if (ret < 0)
             return ret;
 
-        ret = hwaccel->start_frame(avctx, avpkt->data, avpkt->size);
+        ret = hwaccel->start_frame(avctx, avpkt->buf, avpkt->data, avpkt->size);
         if (ret < 0)
             return ret;
 
