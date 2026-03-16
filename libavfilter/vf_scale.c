@@ -135,6 +135,9 @@ typedef struct ScaleContext {
     struct SwsContext *isws[2]; ///< software scaler context for interlaced material
     // context used for forwarding options to sws
     struct SwsContext *sws_opts;
+    struct SwsContext *bayer_rgb48_sws;
+    struct SwsContext *rgb48_target_sws;
+    AVFrame *bayer_rgb48_frame;
     FFFrameSync fs;
 
     /**
@@ -179,6 +182,7 @@ typedef struct ScaleContext {
     int force_divisible_by;
 
     int eval_mode;              ///< expression evaluation mode
+    int use_bayer_rgb48_workaround;
 
 } ScaleContext;
 
@@ -468,6 +472,9 @@ static av_cold void uninit(AVFilterContext *ctx)
     sws_freeContext(scale->sws);
     sws_freeContext(scale->isws[0]);
     sws_freeContext(scale->isws[1]);
+    sws_freeContext(scale->bayer_rgb48_sws);
+    sws_freeContext(scale->rgb48_target_sws);
+    av_frame_free(&scale->bayer_rgb48_frame);
     scale->sws = NULL;
 }
 
@@ -663,6 +670,124 @@ static void calc_chroma_pos(int *h_pos_out, int *v_pos_out, int chroma_loc,
     *v_pos_out = v_sub ? v_pos : -513;
 }
 
+static int use_bayer_rgb48_workaround(enum AVPixelFormat src_format,
+                                      enum AVPixelFormat dst_format)
+{
+    switch (src_format) {
+    case AV_PIX_FMT_BAYER_BGGR16LE:
+    case AV_PIX_FMT_BAYER_BGGR16BE:
+    case AV_PIX_FMT_BAYER_RGGB16LE:
+    case AV_PIX_FMT_BAYER_RGGB16BE:
+    case AV_PIX_FMT_BAYER_GBRG16LE:
+    case AV_PIX_FMT_BAYER_GBRG16BE:
+    case AV_PIX_FMT_BAYER_GRBG16LE:
+    case AV_PIX_FMT_BAYER_GRBG16BE:
+        return dst_format == AV_PIX_FMT_NV12 || dst_format == AV_PIX_FMT_NV21;
+    default:
+        return 0;
+    }
+}
+
+static int init_sws_context(AVFilterContext *ctx, ScaleContext *scale,
+                            struct SwsContext **psws,
+                            int src_w, int src_h, enum AVPixelFormat src_format,
+                            int dst_w, int dst_h, enum AVPixelFormat dst_format,
+                            const AVPixFmtDescriptor *src_desc,
+                            const AVPixFmtDescriptor *dst_desc,
+                            int src_range, int dst_range,
+                            int src_colorspace, int dst_colorspace,
+                            int src_chroma_loc, int dst_chroma_loc,
+                            int field_index)
+{
+    int in_full, out_full, brightness, contrast, saturation;
+    int h_chr_pos, v_chr_pos;
+    const int *inv_table, *table;
+    struct SwsContext *s = sws_alloc_context();
+    int ret;
+
+    if (!s)
+        return AVERROR(ENOMEM);
+    *psws = s;
+
+    ret = av_opt_copy(s, scale->sws_opts);
+    if (ret < 0)
+        return ret;
+
+    av_opt_set_int(s, "srcw", src_w, 0);
+    av_opt_set_int(s, "srch", src_h, 0);
+    av_opt_set_int(s, "src_format", src_format, 0);
+    av_opt_set_int(s, "dstw", dst_w, 0);
+    av_opt_set_int(s, "dsth", dst_h, 0);
+    av_opt_set_int(s, "dst_format", dst_format, 0);
+
+    if (src_range != AVCOL_RANGE_UNSPECIFIED)
+        av_opt_set_int(s, "src_range", src_range == AVCOL_RANGE_JPEG, 0);
+    if (dst_range != AVCOL_RANGE_UNSPECIFIED)
+        av_opt_set_int(s, "dst_range", dst_range == AVCOL_RANGE_JPEG, 0);
+
+    calc_chroma_pos(&h_chr_pos, &v_chr_pos, src_chroma_loc,
+                    scale->in_h_chr_pos, scale->in_v_chr_pos,
+                    src_desc->log2_chroma_w, src_desc->log2_chroma_h,
+                    field_index);
+    av_opt_set_int(s, "src_h_chr_pos", h_chr_pos, 0);
+    av_opt_set_int(s, "src_v_chr_pos", v_chr_pos, 0);
+
+    calc_chroma_pos(&h_chr_pos, &v_chr_pos, dst_chroma_loc,
+                    scale->out_h_chr_pos, scale->out_v_chr_pos,
+                    dst_desc->log2_chroma_w, dst_desc->log2_chroma_h,
+                    field_index);
+    av_opt_set_int(s, "dst_h_chr_pos", h_chr_pos, 0);
+    av_opt_set_int(s, "dst_v_chr_pos", v_chr_pos, 0);
+
+    ret = sws_init_context(s, NULL, NULL);
+    if (ret < 0)
+        return ret;
+
+    sws_getColorspaceDetails(s, (int **)&inv_table, &in_full,
+                             (int **)&table, &out_full,
+                             &brightness, &contrast, &saturation);
+
+    if (src_colorspace == -1)
+        ;
+    else if (src_colorspace != AVCOL_SPC_UNSPECIFIED)
+        inv_table = sws_getCoefficients(src_colorspace);
+
+    if (dst_colorspace != AVCOL_SPC_UNSPECIFIED)
+        table = sws_getCoefficients(dst_colorspace);
+    else if (src_colorspace != AVCOL_SPC_UNSPECIFIED)
+        table = inv_table;
+
+    sws_setColorspaceDetails(s, inv_table, in_full,
+                             table, out_full,
+                             brightness, contrast, saturation);
+
+    return 0;
+}
+
+static int scale_frame_bayer_rgb48_workaround(ScaleContext *scale, AVFrame *dst,
+                                              const AVFrame *src)
+{
+    AVFrame *tmp = scale->bayer_rgb48_frame;
+    int ret;
+
+    if (!tmp)
+        return AVERROR(ENOMEM);
+
+    tmp->color_range = src->color_range;
+    tmp->colorspace = src->colorspace;
+    tmp->chroma_location = src->chroma_location;
+
+    ret = av_frame_make_writable(tmp);
+    if (ret < 0)
+        return ret;
+
+    ret = sws_scale_frame(scale->bayer_rgb48_sws, tmp, src);
+    if (ret < 0)
+        return ret;
+
+    return sws_scale_frame(scale->rgb48_target_sws, dst, tmp);
+}
+
 static int config_props(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
@@ -717,7 +842,14 @@ static int config_props(AVFilterLink *outlink)
         sws_freeContext(scale->isws[0]);
     if (scale->isws[1])
         sws_freeContext(scale->isws[1]);
+    if (scale->bayer_rgb48_sws)
+        sws_freeContext(scale->bayer_rgb48_sws);
+    if (scale->rgb48_target_sws)
+        sws_freeContext(scale->rgb48_target_sws);
     scale->isws[0] = scale->isws[1] = scale->sws = NULL;
+    scale->bayer_rgb48_sws = scale->rgb48_target_sws = NULL;
+    scale->use_bayer_rgb48_workaround = 0;
+    av_frame_free(&scale->bayer_rgb48_frame);
     if (inlink0->w == outlink->w &&
         inlink0->h == outlink->h &&
         in_range == outlink->color_range &&
@@ -727,68 +859,65 @@ static int config_props(AVFilterLink *outlink)
         ;
     else {
         struct SwsContext **swscs[3] = {&scale->sws, &scale->isws[0], &scale->isws[1]};
+        const AVPixFmtDescriptor *rgb48_desc = av_pix_fmt_desc_get(AV_PIX_FMT_RGB48);
         int i;
 
-        for (i = 0; i < 3; i++) {
-            int in_full, out_full, brightness, contrast, saturation;
-            int h_chr_pos, v_chr_pos;
-            const int *inv_table, *table;
-            struct SwsContext *const s = sws_alloc_context();
-            if (!s)
-                return AVERROR(ENOMEM);
-            *swscs[i] = s;
+        scale->use_bayer_rgb48_workaround = use_bayer_rgb48_workaround(inlink0->format, outfmt);
 
-            ret = av_opt_copy(s, scale->sws_opts);
+        for (i = 0; i < 3; i++) {
+            ret = init_sws_context(ctx, scale, swscs[i],
+                                   inlink0->w, inlink0->h >> !!i, inlink0->format,
+                                   outlink->w, outlink->h >> !!i, outfmt,
+                                   desc, outdesc,
+                                   in_range, outlink->color_range,
+                                   in_colorspace, outlink->colorspace,
+                                   scale->in_chroma_loc, scale->out_chroma_loc,
+                                   i);
             if (ret < 0)
                 return ret;
 
-            av_opt_set_int(s, "srcw", inlink0 ->w, 0);
-            av_opt_set_int(s, "srch", inlink0 ->h >> !!i, 0);
-            av_opt_set_int(s, "src_format", inlink0->format, 0);
-            av_opt_set_int(s, "dstw", outlink->w, 0);
-            av_opt_set_int(s, "dsth", outlink->h >> !!i, 0);
-            av_opt_set_int(s, "dst_format", outfmt, 0);
-            if (in_range != AVCOL_RANGE_UNSPECIFIED)
-                av_opt_set_int(s, "src_range",
-                               in_range == AVCOL_RANGE_JPEG, 0);
-            if (outlink->color_range != AVCOL_RANGE_UNSPECIFIED)
-                av_opt_set_int(s, "dst_range",
-                               outlink->color_range == AVCOL_RANGE_JPEG, 0);
-
-            calc_chroma_pos(&h_chr_pos, &v_chr_pos, scale->in_chroma_loc,
-                            scale->in_h_chr_pos, scale->in_v_chr_pos,
-                            desc->log2_chroma_w, desc->log2_chroma_h, i);
-            av_opt_set_int(s, "src_h_chr_pos", h_chr_pos, 0);
-            av_opt_set_int(s, "src_v_chr_pos", v_chr_pos, 0);
-
-            calc_chroma_pos(&h_chr_pos, &v_chr_pos, scale->out_chroma_loc,
-                            scale->out_h_chr_pos, scale->out_v_chr_pos,
-                            outdesc->log2_chroma_w, outdesc->log2_chroma_h, i);
-            av_opt_set_int(s, "dst_h_chr_pos", h_chr_pos, 0);
-            av_opt_set_int(s, "dst_v_chr_pos", v_chr_pos, 0);
-
-            if ((ret = sws_init_context(s, NULL, NULL)) < 0)
-                return ret;
-
-            sws_getColorspaceDetails(s, (int **)&inv_table, &in_full,
-                                     (int **)&table, &out_full,
-                                     &brightness, &contrast, &saturation);
-
-            if (scale->in_color_matrix == -1 /* auto */)
-                inv_table = sws_getCoefficients(inlink0->colorspace);
-            else if (scale->in_color_matrix != AVCOL_SPC_UNSPECIFIED)
-                inv_table = sws_getCoefficients(scale->in_color_matrix);
-            if (outlink->colorspace != AVCOL_SPC_UNSPECIFIED)
-                table = sws_getCoefficients(outlink->colorspace);
-            else if (scale->in_color_matrix != AVCOL_SPC_UNSPECIFIED)
-                table = inv_table;
-
-            sws_setColorspaceDetails(s, inv_table, in_full,
-                                     table, out_full,
-                                     brightness, contrast, saturation);
-
             if (!scale->interlaced)
                 break;
+        }
+
+        if (scale->use_bayer_rgb48_workaround) {
+            ret = init_sws_context(ctx, scale, &scale->bayer_rgb48_sws,
+                                   inlink0->w, inlink0->h, inlink0->format,
+                                   inlink0->w, inlink0->h, AV_PIX_FMT_RGB48,
+                                   desc, rgb48_desc,
+                                   in_range, outlink->color_range,
+                                   in_colorspace, outlink->colorspace,
+                                   scale->in_chroma_loc, scale->out_chroma_loc,
+                                   0);
+            if (ret < 0)
+                return ret;
+
+            ret = init_sws_context(ctx, scale, &scale->rgb48_target_sws,
+                                   inlink0->w, inlink0->h, AV_PIX_FMT_RGB48,
+                                   outlink->w, outlink->h, outfmt,
+                                   rgb48_desc, outdesc,
+                                   in_range, outlink->color_range,
+                                   in_colorspace, outlink->colorspace,
+                                   scale->in_chroma_loc, scale->out_chroma_loc,
+                                   0);
+            if (ret < 0)
+                return ret;
+
+            scale->bayer_rgb48_frame = av_frame_alloc();
+            if (!scale->bayer_rgb48_frame)
+                return AVERROR(ENOMEM);
+
+            scale->bayer_rgb48_frame->format = AV_PIX_FMT_RGB48;
+            scale->bayer_rgb48_frame->width  = inlink0->w;
+            scale->bayer_rgb48_frame->height = inlink0->h;
+            ret = av_frame_get_buffer(scale->bayer_rgb48_frame, 0);
+            if (ret < 0)
+                return ret;
+
+            av_log(ctx, AV_LOG_VERBOSE,
+                   "Using internal Bayer RGB48 workaround for %s -> %s\n",
+                   av_get_pix_fmt_name(inlink0->format),
+                   av_get_pix_fmt_name(outfmt));
         }
     }
 
@@ -1046,6 +1175,9 @@ scale:
         ret = scale_field(scale, out, in, 0);
         if (ret >= 0)
             ret = scale_field(scale, out, in, 1);
+    } else if (scale->use_bayer_rgb48_workaround &&
+               scale->bayer_rgb48_sws && scale->rgb48_target_sws) {
+        ret = scale_frame_bayer_rgb48_workaround(scale, out, in);
     } else {
         ret = sws_scale_frame(scale->sws, out, in);
     }
