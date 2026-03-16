@@ -426,22 +426,6 @@ int ff_vk_decode_frame(AVCodecContext *avctx,
     cur_vk_ref[0].slotIndex = -1;
     decode_start.referenceSlotCount++;
 
-    if (dec->exec_pool.nb_queries && exec->had_submission) {
-        uint32_t *result;
-        ret = ff_vk_exec_get_query(&ctx->s, exec, (void **)&result,
-                                   VK_QUERY_RESULT_WAIT_BIT);
-        if (ret != VK_NOT_READY && ret != VK_SUCCESS) {
-            av_log(avctx, AV_LOG_ERROR, "Unable to perform query: %s!\n",
-                   ff_vk_ret2str(ret));
-            return AVERROR_EXTERNAL;
-        }
-
-        av_log(avctx,
-               result[0] != VK_QUERY_RESULT_STATUS_COMPLETE_KHR ?
-                   AV_LOG_ERROR : AV_LOG_DEBUG,
-               "Result of previous frame decoding: %u\n", result[0]);
-    }
-
     sd_buf = (FFVkBuffer *)vp->slices_buf->data;
 
     /* Flush if needed */
@@ -596,15 +580,7 @@ int ff_vk_decode_frame(AVCodecContext *avctx,
     /* Start, use parameters, decode and end decoding */
     vk->CmdBeginVideoCodingKHR(cmd_buf, &decode_start);
 
-    /* Start status query */
-    if (dec->exec_pool.nb_queries)
-        vk->CmdBeginQuery(cmd_buf, dec->exec_pool.query_pool, exec->query_idx + 0, 0);
-
     vk->CmdDecodeVideoKHR(cmd_buf, &vp->decode_info);
-
-    /* End status query */
-    if (dec->exec_pool.nb_queries)
-        vk->CmdEndQuery(cmd_buf, dec->exec_pool.query_pool, exec->query_idx + 0);
 
     vk->CmdEndVideoCodingKHR(cmd_buf, &decode_end);
 
