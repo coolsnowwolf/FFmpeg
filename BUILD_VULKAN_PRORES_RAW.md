@@ -238,25 +238,136 @@ VULKAN  libavcodec/vulkan/prores_raw.c
 
 ### 纯解码 benchmark 对比结论
 
-纯解码场景下，backport 分支同样慢于官方 8.0.1：
+纯解码场景下，backport 分支最初同样慢于官方 8.0.1：
 
 - backport: `45 fps`
 - n8.0.1: `66 fps`
 
 这说明性能差异不是单纯由后面的 `scale_vaapi` / `h264_vaapi` 造成的，解码侧本身也还有差距。
 
+## 后续性能追查
+
+在确认功能已经走通以后，后续又继续对 8.0.1 与当前 backport 的实现做了针对性对比，目标是解释纯解码吞吐和 CPU 时间为什么仍显著落后。
+
+### 第一轮排查: Vulkan 执行池
+
+先对比了 `libavutil/vulkan.c` 的执行池实现，验证了旧式“单 command pool + mutex”是否是主要 CPU 瓶颈。为此专门做了一个最小 backport：
+
+- `ff_vk_exec_get()` 统一为带 `FFVulkanContext *` 参数的新接口
+- 执行池改为每个 exec context 各自持有 command pool
+- 去掉 fence reset/wait 周围的 mutex 路径
+
+这轮改动可以成功构建，但 benchmark 结论是否定的：
+
+- 旧执行池基线约 `speed=2.03x`
+- 新执行池 backport 约 `speed=1.69x`
+- 官方 8.0.1 约 `speed=2.60x`
+
+也就是说，“单 pool + mutex”并不是当时主要 CPU 开销来源。
+
+### 第二轮排查: userspace CPU hotspot
+
+由于普通用户权限下 `perf record` 被 `perf_event_paranoid=4` 阻止，后续改用 `valgrind --tool=callgrind` 对当前 backport 做了 userspace CPU 热点分析。
+
+热点结论是：
+
+- CPU 时间主要打在 `libavcodec/prores_raw.c` 的 `get_value` / `decode_comp` / IDCT 软件路径
+- 另外有一块一次性开销来自 `glslang` shader 编译初始化
+- `libavutil/vulkan.c` 的公用执行池函数本身并不是主要热点
+
+### 第三轮排查: `prores_raw.c` 与 `vulkan_prores_raw.c`
+
+继续直接对比了 `libavcodec/prores_raw.c` 和 `libavcodec/vulkan_prores_raw.c` 在 backport 与 8.0.1 中的差异。
+
+结论分两部分：
+
+1. `libavcodec/prores_raw.c` 的 CPU 软件解码路径在两个版本里本质一致，`get_value` / `decode_comp` / `idct_put_bayer` 这条实现并没有被 8.0.1 删除。
+2. 真正的关键差异在 hwaccel `start_frame` 接口和 Vulkan slice 数据输入路径，而不在 compute shader 本体。
+
+## 最终性能修复: host-mapped slices 零拷贝回移植
+
+继续对比后确认，8.0.1 的关键优化点是：
+
+- `FFHWAccel.start_frame` 接口已经扩展为接收 `AVBufferRef *buf_ref`
+- `libavcodec/vulkan_prores_raw.c` 可利用 `buf_ref` 与 `FF_VK_EXT_EXTERNAL_HOST_MEMORY`
+- 在支持时直接把整包输入 host-map 成 `vp->slices_buf`
+- 后续 `decode_slice` 只记录各 tile 的 offset，不再逐 slice 调 `ff_vk_decode_add_slice()` 拷贝/封装
+
+基于这条结论，后续在当前 backport 分支上又补了一轮最小回移植：
+
+### 新增/修正内容
+
+- `libavcodec/hwaccel_internal.h`
+  - `FFHWAccel.start_frame` 扩展为 `buf_ref + buf + size`
+- 调用点同步
+  - `prores_raw.c`
+  - `proresdec.c`
+  - `vp8.c`
+  - `vp9.c`
+  - `mjpegdec.c`
+  - `vc1dec.c`
+  - 若干 `FF_HW_CALL(... start_frame, ...)` 调用点
+- `libavutil/vulkan.h` / `libavutil/vulkan.c`
+  - 为 `FFVkBuffer` 增加 `host_ref` / `virtual_offset`
+  - 增加 `ff_vk_host_map_buffer()`
+  - 补齐 host-map buffer 生命周期释放逻辑
+- `libavcodec/vulkan_prores_raw.c`
+  - `start_frame()` 中支持用 `buf_ref` 直接 host-map 整包 slices buffer
+  - `decode_slice()` 中若 `slices_buf->host_ref` 有效，则仅记录 offset，不再做逐 slice 拷贝
+
+### 顺带清理
+
+为了让这条接口链在当前构建配置下保持干净，还顺手把当前 Linux 构建中会触发 warning 的若干 VAAPI/Vulkan `start_frame` 实现签名也同步到了新接口，最终把 `start_frame` 相关 warning 收敛到了 0。
+
+## 最新纯 Vulkan 解码 benchmark
+
+在完成 `buf_ref + host-map` 回移植后，用同一条纯 Vulkan 解码命令重新测了一轮：
+
+```bash
+./ffmpeg \
+  -nostdin -threads:v 1 \
+  -init_hw_device vulkan:0 \
+  -hwaccel vulkan \
+  -hwaccel_output_format vulkan \
+  -benchmark \
+  -i "/home/lean/Desktop/a7s III ProRes RAW HQ.mov" \
+  -an -f null -
+```
+
+### backport 分支最新结果
+
+- `speed=2.73x`
+- `ELAPSED=5.51`
+- `USER=0.34`
+- `SYS=0.84`
+- ffmpeg `bench`: `utime=0.186s stime=0.780s rtime=5.277s`
+
+### 官方 8.0.1 同批次对照结果
+
+- `speed=2.66x`
+- `ELAPSED=5.63`
+- `USER=0.34`
+- `SYS=0.84`
+- ffmpeg `bench`: `utime=0.198s stime=0.776s rtime=5.417s`
+
+### 最新 benchmark 对比结论
+
+完成 `buf_ref + host-map slices` 回移植后，当前 backport 分支的纯 Vulkan ProRes RAW 解码性能已经追平官方 8.0.1，同一台机器、同一样片、同一条命令下：
+
+- 墙钟时间已经处于同一量级
+- 用户态 CPU 时间已经与 8.0.1 基本一致
+- 输出像素格式仍保持 `vulkan`
+
+这说明此前纯解码性能差距的主要根因，确实是 Vulkan hwaccel 输入 slice 路径缺少 8.0.1 的 `AVBufferRef + host-map` 零拷贝链路，而不是 ProRes RAW compute shader 本体或执行池模型本身。
+
 ## 最终结论
 
 1. 当前 `backport-8.0.1` 分支已经严格建立在 `n7.1.3` tag 基线上。
 2. ProRes RAW 软件解码、Vulkan compute decode 基础设施、Vulkan hwaccel 本体，以及参考分支上的关键修复都已经回移植并推送。
-3. `CONFIG_PRORES_RAW_VULKAN_HWACCEL` 已经从 `0` 变为 `1`，构建也已通过。
-4. 运行时已经明确看到 `pixfmt:vulkan` 与 `wrapped_avframe, vulkan(progressive)`，因此可以确认这条分支确实真正走了 GPU 解码加速，而不是软件回退。
-5. 但当前性能还没有追平官方 8.0.1。
-6. 在本次同链路测试中：
-   - Vulkan ProRes RAW 转码: backport 约 `9.2 fps`，8.0.1 约 `15 fps`
-   - 纯 Vulkan 解码: backport 约 `45 fps`，8.0.1 约 `66 fps`
-
-因此，当前状态应定义为：
+3. `CONFIG_PRORES_RAW_VULKAN_HWACCEL` 已经从 `0` 变为 `1`，构建通过，运行时也已确认真实输出 `vulkan` hardware frames。
+4. 纯 Vulkan ProRes RAW 解码在完成 `buf_ref + host-map slices` 回移植后，性能已经追平官方 8.0.1。
+5. 当前这条 backport 分支的结论不再是“功能通了但性能落后”，而是：
 
 - 功能上已经打通 Vulkan ProRes RAW GPU 解码
-- 性能上仍落后于官方 8.0.1，后续仍值得继续比对 8.0.1 的后续实现差异
+- 关键性能路径已经追平官方 8.0.1
+- 造成此前性能差距的主要缺口已经定位并修复
