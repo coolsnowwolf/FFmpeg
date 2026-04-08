@@ -2985,7 +2985,6 @@ static int mov_finalize_stsd_codec(MOVContext *c, AVIOContext *pb,
         break;
     case AV_CODEC_ID_PRORES_RAW:
     case AV_CODEC_ID_PRORES:
-    case AV_CODEC_ID_APV:
     case AV_CODEC_ID_EVC:
     case AV_CODEC_ID_AV1:
         /* field_order detection of H264 requires parsing */
