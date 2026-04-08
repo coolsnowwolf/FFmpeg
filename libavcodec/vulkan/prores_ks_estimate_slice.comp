@@ -1,0 +1,212 @@
+/*
+ * This file is part of FFmpeg.
+ */
+
+#define U8(x) (uint8_t(x))
+
+#define CFACTOR_Y444 3
+#define GET_SIGN(x) ((x) >> 31)
+#define MAKE_CODE(x) (((x) * 2) ^ GET_SIGN(x))
+#define FFALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
+#define SCORE_LIMIT 1073741823
+
+int estimate_vlc(uint codebook, int val)
+{
+    uint switch_bits = (codebook & 3u) + 1u;
+    uint rice_order = codebook >> 5;
+    uint exp_order = (codebook >> 2) & 7u;
+    uint switch_val = switch_bits << rice_order;
+
+    if (val >= int(switch_val)) {
+        val -= int(switch_val - (1u << exp_order));
+        int exponent = findMSB(val);
+        return exponent * 2 - int(exp_order) + int(switch_bits) + 1;
+    }
+
+    return (val >> int(rice_order)) + int(rice_order) + 1;
+}
+
+int estimate_dcs(inout int error, uint slice, uint plane, uint q)
+{
+    const uint8_t dc_codebook[7] = { U8(0x04), U8(0x28), U8(0x28), U8(0x4D), U8(0x4D), U8(0x70), U8(0x70) };
+    uint blocks_per_mb = plane != 0u && CHROMA_FACTOR != CFACTOR_Y444 ? 2u : 4u;
+    uint blocks_per_slice = slices[slice].mbs_per_slice * blocks_per_mb;
+    int codebook = 5;
+    int coeff = slices[slice].coeffs[plane][0];
+    int scale = plane != 0u ? qmat_chroma[q][0] : qmat[q][0];
+    int prev_dc = (coeff - 0x4000) / scale;
+    int bits = estimate_vlc(0xB8u, MAKE_CODE(prev_dc));
+    int sign = 0;
+
+    for (uint i = 1u; i < blocks_per_slice; i++) {
+        coeff = slices[slice].coeffs[plane][i];
+        int dc = (coeff - 0x4000) / scale;
+        error += abs(coeff - 0x4000) % scale;
+        int delta = dc - prev_dc;
+        int new_sign = GET_SIGN(delta);
+        delta = (delta ^ sign) - sign;
+        int code = MAKE_CODE(delta);
+        bits += estimate_vlc(dc_codebook[codebook], code);
+        codebook = min(code, 6);
+        sign = new_sign;
+        prev_dc = dc;
+    }
+
+    return bits;
+}
+
+int estimate_acs(inout int error, uint slice, uint plane, uint q)
+{
+    const uint8_t run_to_cb[16] = { U8(0x06), U8(0x06), U8(0x05), U8(0x05), U8(0x04), U8(0x29), U8(0x29), U8(0x29), U8(0x29), U8(0x28), U8(0x28), U8(0x28), U8(0x28), U8(0x28), U8(0x28), U8(0x4C) };
+    const uint8_t level_to_cb[10] = { U8(0x04), U8(0x0A), U8(0x05), U8(0x06), U8(0x04), U8(0x28), U8(0x28), U8(0x28), U8(0x28), U8(0x4C) };
+    uint blocks_per_mb = plane != 0u && CHROMA_FACTOR != CFACTOR_Y444 ? 2u : 4u;
+    uint blocks_per_slice = slices[slice].mbs_per_slice * blocks_per_mb;
+    int prev_run = 4;
+    int prev_level = 2;
+    int bits = 0;
+    int run = 0;
+
+    for (uint i = 1u; i < 64u; i++) {
+        int quant = plane != 0u ? qmat_chroma[q][i] : qmat[q][i];
+        for (uint j = 0u; j < blocks_per_slice; j++) {
+            uint idx = i * blocks_per_slice + j;
+            int coeff = slices[slice].coeffs[plane][idx];
+            int level = coeff / quant;
+            error += abs(coeff) % quant;
+            if (level != 0) {
+                int abs_level = abs(level);
+                bits += estimate_vlc(run_to_cb[prev_run], run);
+                bits += estimate_vlc(level_to_cb[prev_level], abs_level - 1) + 1;
+                prev_run = min(run, 15);
+                prev_level = min(abs_level, 9);
+                run = 0;
+            } else {
+                run++;
+            }
+        }
+    }
+
+    return bits;
+}
+
+int estimate_slice_plane(inout int error, uint slice, uint plane, uint q)
+{
+    int bits = estimate_dcs(error, slice, plane, q);
+    bits += estimate_acs(error, slice, plane, q);
+    return FFALIGN(bits, 8);
+}
+
+#if ALPHA_BITS > 0
+int est_alpha_diff(int cur, int prev)
+{
+    const int dbits = (ALPHA_BITS == 8) ? 4 : 7;
+    const int dsize = 1 << (dbits - 1);
+    int diff = cur - prev;
+    diff = zero_extend(diff, ALPHA_BITS);
+    if (diff >= (1 << ALPHA_BITS) - dsize)
+        diff -= 1 << ALPHA_BITS;
+    if (diff < -dsize || diff > dsize || diff == 0)
+        return ALPHA_BITS + 1;
+    return dbits + 1;
+}
+
+int estimate_alpha_plane(uint slice)
+{
+    const int mask = (1 << ALPHA_BITS) - 1;
+    const int num_coeffs = int(slices[slice].mbs_per_slice) * 256;
+    int prev = mask;
+    int idx = 0;
+    int run = 0;
+    int bits;
+    int cur = slices[slice].coeffs[3][idx++];
+
+    bits = est_alpha_diff(cur, prev);
+    prev = cur;
+    do {
+        cur = slices[slice].coeffs[3][idx++];
+        if (cur != prev) {
+            bits += run == 0 ? 1 : (run < 0x10 ? 5 : 16);
+            bits += est_alpha_diff(cur, prev);
+            prev = cur;
+            run = 0;
+        } else {
+            run++;
+        }
+    } while (idx < num_coeffs);
+
+    bits += run != 0 ? (run < 0x10 ? 5 : 16) : 1;
+    return bits;
+}
+#endif
+
+int sum_of_planes(int value)
+{
+    if (NUM_PLANES == 3) {
+        uint base = (gl_SubgroupInvocationID / 3u) * 3u;
+        return subgroupShuffle(value, base) +
+               subgroupShuffle(value, base + 1u) +
+               subgroupShuffle(value, base + 2u);
+    }
+    return subgroupClusteredAdd(value, 4u);
+}
+
+void main()
+{
+    uint slice = gl_GlobalInvocationID.x / uint(NUM_PLANES);
+    uint plane = gl_LocalInvocationID.x % uint(NUM_PLANES);
+    uint q = uint(MIN_QUANT) + gl_GlobalInvocationID.y;
+    if (slice >= uint(SLICES_PER_PICTURE))
+        return;
+
+    int error = 0;
+    int bits;
+#if ALPHA_BITS > 0
+    bits = plane == 3u ? estimate_alpha_plane(slice)
+                       : estimate_slice_plane(error, slice, plane, q);
+#else
+    bits = estimate_slice_plane(error, slice, plane, q);
+#endif
+
+    scores[slice].bits[q][plane] = FFALIGN(bits, 8);
+    scores[slice].score[q][plane] = error;
+
+    int total_bits = sum_of_planes(bits);
+    int total_score = sum_of_planes(error);
+    if (total_bits > 65000 * 8)
+        total_score = SCORE_LIMIT;
+
+    scores[slice].total_bits[q] = total_bits;
+    scores[slice].total_score[q] = total_score;
+
+    if (q != uint(MAX_QUANT))
+        return;
+
+    uint mbs_per_slice = slices[slice].mbs_per_slice;
+    if (total_bits <= BITS_PER_MB * int(mbs_per_slice)) {
+        scores[slice].total_bits[MAX_QUANT + 1] = total_bits;
+        scores[slice].total_score[MAX_QUANT + 1] = total_score + 1;
+        scores[slice].bits[MAX_QUANT + 1][plane] = FFALIGN(bits, 8);
+        scores[slice].score[MAX_QUANT + 1][plane] = error;
+        scores[slice].overquant = MAX_QUANT;
+    } else {
+        for (q = uint(MAX_QUANT + 1); q < 128u; ++q) {
+            error = 0;
+#if ALPHA_BITS > 0
+            bits = plane == 3u ? estimate_alpha_plane(slice)
+                               : estimate_slice_plane(error, slice, plane, q);
+#else
+            bits = estimate_slice_plane(error, slice, plane, q);
+#endif
+            total_bits = sum_of_planes(bits);
+            total_score = sum_of_planes(error);
+            if (total_bits <= BITS_PER_MB * int(mbs_per_slice))
+                break;
+        }
+
+        scores[slice].bits[MAX_QUANT + 1][plane] = bits;
+        scores[slice].score[MAX_QUANT + 1][plane] = error;
+        scores[slice].total_bits[MAX_QUANT + 1] = total_bits;
+        scores[slice].total_score[MAX_QUANT + 1] = total_score;
+        scores[slice].overquant = int(q);
+    }
+}

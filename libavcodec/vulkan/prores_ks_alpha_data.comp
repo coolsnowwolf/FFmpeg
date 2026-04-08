@@ -1,0 +1,47 @@
+/*
+ * This file is part of FFmpeg.
+ */
+
+const uvec3 edge_mps_table[8] = uvec3[](
+    uvec3(0, 0, 0),
+    uvec3(1, 0, 0),
+    uvec3(2, 0, 0),
+    uvec3(2, 1, 0),
+    uvec3(4, 0, 0),
+    uvec3(4, 1, 0),
+    uvec3(4, 2, 0),
+    uvec3(4, 2, 1)
+);
+
+void main()
+{
+    ivec2 coord = min(ivec2(gl_GlobalInvocationID.xy), imageSize(planes[3]) - ivec2(1));
+    uint16_t alpha = uint16_t(imageLoad(planes[3], coord).x * 65535.0);
+
+    if (ALPHA_BITS == 8)
+        alpha >>= 2;
+    else
+        alpha = (alpha << 6) | (alpha >> 4);
+
+    uint mbs_per_slice = MAX_MBS_PER_SLICE;
+    uint slices_width = WIDTH_IN_MB / mbs_per_slice;
+    uint mb_width = slices_width * mbs_per_slice;
+    uint slice_x = gl_WorkGroupID.x / mbs_per_slice;
+    uint slice_y = gl_WorkGroupID.y;
+    uvec2 slice_base = uvec2(slice_x * mbs_per_slice * 16u, slice_y * 16u);
+
+    if (gl_WorkGroupID.x >= mb_width) {
+        uint edge_mb = gl_WorkGroupID.x - mb_width;
+        uvec3 table = edge_mps_table[WIDTH_IN_MB - mb_width];
+        uvec3 base = uvec3(0, table.x, table.x + table.y);
+        uint edge_slice = edge_mb < base.y ? 0 : (edge_mb < base.z ? 1 : 2);
+        slice_x += edge_slice;
+        slice_base.x += base[edge_slice] * 16u;
+        mbs_per_slice = table[edge_slice];
+    }
+
+    uint slice = slice_y * SLICES_PER_ROW + slice_x;
+    uvec2 coeff_coord = uvec2(coord) - slice_base;
+    uint coeff = coeff_coord.y * (mbs_per_slice * 16u) + coeff_coord.x;
+    slices[slice].coeffs[3][coeff] = int16_t(alpha);
+}

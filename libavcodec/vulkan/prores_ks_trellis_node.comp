@@ -1,0 +1,139 @@
+/*
+ * This file is part of FFmpeg.
+ */
+
+#define TRELLIS_WIDTH 16
+#define SCORE_LIMIT 1073741823
+
+struct TrellisNode {
+    int prev_node;
+    int quant;
+    int bits;
+    int score;
+};
+
+shared int subgroup_sizes[NUM_SUBGROUPS];
+
+int slice_sizes[SLICES_PER_ROW];
+TrellisNode nodes[(SLICES_PER_ROW + 1) * TRELLIS_WIDTH];
+
+int find_slice_quant(int slice_x)
+{
+    int slice = int(gl_LocalInvocationID.x) * SLICES_PER_ROW + slice_x;
+    int trellis_node = (slice_x + 1) * TRELLIS_WIDTH;
+
+    for (int q = MIN_QUANT; q < MAX_QUANT + 2; q++) {
+        nodes[trellis_node + q].prev_node = -1;
+        nodes[trellis_node + q].quant = q;
+    }
+
+    int mbs = (slice_x + 1) * MBS_PER_SLICE;
+    nodes[trellis_node + MAX_QUANT + 1].quant = scores[slice].overquant;
+
+    int bits_limit = mbs * BITS_PER_MB;
+    for (int pq = MIN_QUANT; pq < MAX_QUANT + 2; pq++) {
+        int prev = trellis_node - TRELLIS_WIDTH + pq;
+        for (int q = MIN_QUANT; q < MAX_QUANT + 2; q++) {
+            int cur = trellis_node + q;
+            int bits = nodes[prev].bits + scores[slice].total_bits[q];
+            int error = scores[slice].total_score[q];
+            int new_score;
+
+            if (bits > bits_limit)
+                error = SCORE_LIMIT;
+            new_score = (nodes[prev].score < SCORE_LIMIT && error < SCORE_LIMIT)
+                        ? nodes[prev].score + error
+                        : SCORE_LIMIT;
+
+            if (nodes[cur].prev_node == -1 || nodes[cur].score >= new_score) {
+                nodes[cur].bits = bits;
+                nodes[cur].score = new_score;
+                nodes[cur].prev_node = prev;
+            }
+        }
+    }
+
+    int error = nodes[trellis_node + MIN_QUANT].score;
+    int pq = trellis_node + MIN_QUANT;
+    for (int q = MIN_QUANT + 1; q < MAX_QUANT + 2; q++) {
+        if (nodes[trellis_node + q].score <= error) {
+            error = nodes[trellis_node + q].score;
+            pq = trellis_node + q;
+        }
+    }
+
+    return pq;
+}
+
+int find_slice_row_quants()
+{
+    for (int i = MIN_QUANT; i < MAX_QUANT + 2; i++) {
+        nodes[i].prev_node = -1;
+        nodes[i].bits = 0;
+        nodes[i].score = 0;
+    }
+
+    int q = 0;
+    for (int slice_x = 0; slice_x < SLICES_PER_ROW; slice_x++)
+        q = find_slice_quant(slice_x);
+
+    int slice_hdr_size = 2 * NUM_PLANES;
+    int slice_row_size = slice_hdr_size * SLICES_PER_ROW;
+    int y = int(gl_LocalInvocationID.x);
+    for (int x = SLICES_PER_ROW - 1; x >= 0; x--) {
+        int slice = x + y * SLICES_PER_ROW;
+        int quant = nodes[q].quant;
+        int q_idx = min(quant, MAX_QUANT + 1);
+        ivec4 bits = scores[slice].bits[q_idx];
+        slice_sizes[x] = (bits.x + bits.y + bits.z + bits.w) / 8;
+        slice_row_size += slice_sizes[x];
+        scores[slice].quant = quant;
+        q = nodes[q].prev_node;
+    }
+
+    return slice_row_size;
+}
+
+int force_slice_row_quants()
+{
+    int slice_hdr_size = 2 * NUM_PLANES;
+    int slice_row_size = slice_hdr_size * SLICES_PER_ROW;
+    int y = int(gl_LocalInvocationID.x);
+    for (int x = SLICES_PER_ROW - 1; x >= 0; x--) {
+        int slice = x + y * SLICES_PER_ROW;
+        ivec4 bits = scores[slice].bits[0];
+        slice_sizes[x] = (bits.x + bits.y + bits.z + bits.w) / 8;
+        slice_row_size += slice_sizes[x];
+        scores[slice].quant = FORCE_QUANT;
+    }
+
+    return slice_row_size;
+}
+
+void main()
+{
+    int slice_row_size = FORCE_QUANT == 0 ? find_slice_row_quants()
+                                          : force_slice_row_quants();
+
+    int subgroup_sum = subgroupAdd(slice_row_size);
+    subgroup_sizes[gl_SubgroupID] = subgroup_sum;
+    barrier();
+
+    int buf_start = subgroupExclusiveAdd(slice_row_size);
+    for (int i = 0; i < NUM_SUBGROUPS; i++) {
+        if (i >= int(gl_SubgroupID))
+            break;
+        buf_start += subgroup_sizes[i];
+    }
+
+    int slice_hdr_size = 2 * NUM_PLANES;
+    int y = int(gl_LocalInvocationID.x);
+    for (int x = 0; x < SLICES_PER_ROW; x++) {
+        int slice = x + y * SLICES_PER_ROW;
+        scores[slice].buf_start = buf_start;
+        buf_start += slice_hdr_size + slice_sizes[x];
+    }
+
+    if (y == int(gl_WorkGroupSize.x) - 1)
+        frame_size = buf_start;
+}

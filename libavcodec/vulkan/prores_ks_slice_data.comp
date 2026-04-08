@@ -1,0 +1,128 @@
+/*
+ * This file is part of FFmpeg.
+ */
+
+const uvec3 edge_mps_table[8] = uvec3[](
+    uvec3(0, 0, 0),
+    uvec3(1, 0, 0),
+    uvec3(2, 0, 0),
+    uvec3(2, 1, 0),
+    uvec3(4, 0, 0),
+    uvec3(4, 1, 0),
+    uvec3(4, 2, 0),
+    uvec3(4, 2, 1)
+);
+
+const u8vec2 progressive_scan[64] = {
+    u8vec2(0, 0), u8vec2(1, 0), u8vec2(0, 1), u8vec2(1, 1),
+    u8vec2(2, 0), u8vec2(3, 0), u8vec2(2, 1), u8vec2(3, 1),
+    u8vec2(0, 2), u8vec2(1, 2), u8vec2(0, 3), u8vec2(1, 3),
+    u8vec2(2, 2), u8vec2(3, 2), u8vec2(2, 3), u8vec2(3, 3),
+    u8vec2(4, 0), u8vec2(5, 0), u8vec2(4, 1), u8vec2(4, 2),
+    u8vec2(5, 1), u8vec2(6, 0), u8vec2(7, 0), u8vec2(6, 1),
+    u8vec2(5, 2), u8vec2(4, 3), u8vec2(5, 3), u8vec2(6, 2),
+    u8vec2(7, 1), u8vec2(7, 2), u8vec2(6, 3), u8vec2(7, 3),
+    u8vec2(0, 4), u8vec2(1, 4), u8vec2(0, 5), u8vec2(0, 6),
+    u8vec2(1, 5), u8vec2(2, 4), u8vec2(3, 4), u8vec2(2, 5),
+    u8vec2(1, 6), u8vec2(0, 7), u8vec2(1, 7), u8vec2(2, 6),
+    u8vec2(3, 5), u8vec2(4, 4), u8vec2(5, 4), u8vec2(4, 5),
+    u8vec2(3, 6), u8vec2(2, 7), u8vec2(3, 7), u8vec2(4, 6),
+    u8vec2(5, 5), u8vec2(6, 4), u8vec2(7, 4), u8vec2(6, 5),
+    u8vec2(5, 6), u8vec2(4, 7), u8vec2(5, 7), u8vec2(6, 6),
+    u8vec2(7, 5), u8vec2(7, 6), u8vec2(6, 7), u8vec2(7, 7),
+};
+
+const u8vec2 interlaced_scan[64] = {
+    u8vec2(0, 0), u8vec2(0, 1), u8vec2(1, 0), u8vec2(1, 1),
+    u8vec2(0, 2), u8vec2(0, 3), u8vec2(1, 2), u8vec2(1, 3),
+    u8vec2(2, 0), u8vec2(2, 1), u8vec2(3, 0), u8vec2(3, 1),
+    u8vec2(2, 2), u8vec2(2, 3), u8vec2(3, 2), u8vec2(3, 3),
+    u8vec2(0, 4), u8vec2(0, 5), u8vec2(1, 4), u8vec2(2, 4),
+    u8vec2(1, 5), u8vec2(0, 6), u8vec2(0, 7), u8vec2(1, 6),
+    u8vec2(2, 5), u8vec2(3, 4), u8vec2(3, 5), u8vec2(2, 6),
+    u8vec2(1, 7), u8vec2(2, 7), u8vec2(3, 6), u8vec2(3, 7),
+    u8vec2(4, 0), u8vec2(4, 1), u8vec2(5, 0), u8vec2(6, 0),
+    u8vec2(5, 1), u8vec2(4, 2), u8vec2(4, 3), u8vec2(5, 2),
+    u8vec2(6, 1), u8vec2(7, 0), u8vec2(7, 1), u8vec2(6, 2),
+    u8vec2(5, 3), u8vec2(4, 4), u8vec2(4, 5), u8vec2(5, 4),
+    u8vec2(6, 3), u8vec2(7, 2), u8vec2(7, 3), u8vec2(6, 4),
+    u8vec2(5, 5), u8vec2(4, 6), u8vec2(4, 7), u8vec2(5, 6),
+    u8vec2(6, 5), u8vec2(7, 4), u8vec2(7, 5), u8vec2(6, 6),
+    u8vec2(5, 7), u8vec2(6, 7), u8vec2(7, 6), u8vec2(7, 7),
+};
+
+int16_t get_swizzled_coeff(uint blocks_per_slice, uint slice_row, uint idx)
+{
+    uint coeff = slice_row * 8u + idx;
+    u8vec2 coord = PICTURES_PER_FRAME == 1 ? progressive_scan[coeff / blocks_per_slice]
+                                           : interlaced_scan[coeff / blocks_per_slice];
+    uint block = coeff % blocks_per_slice;
+    float v = blocks[block][coord.y * 9u + coord.x];
+    return int16_t(v * float(1 << 11));
+}
+
+void main()
+{
+    uint row = gl_LocalInvocationID.x;
+    uint block = gl_LocalInvocationID.y;
+    uint macroblock = gl_LocalInvocationID.z;
+    uint slice_x = gl_WorkGroupID.x;
+    uint slice_block = macroblock * BLOCKS_PER_MB + block;
+    uint slice = gl_WorkGroupID.y * gl_NumWorkGroups.x + slice_x;
+
+    uint mbs_per_slice = MAX_MBS_PER_SLICE;
+    uint mb_width = 4u * BLOCKS_PER_MB;
+    uint slices_width = WIDTH_IN_MB / MAX_MBS_PER_SLICE;
+    uvec2 slice_base = gl_WorkGroupID.xy * uvec2(MAX_MBS_PER_SLICE * mb_width, 16u);
+
+    if (slice_x >= slices_width) {
+        uint edge_slice = slice_x - slices_width;
+        uvec3 table = edge_mps_table[WIDTH_IN_MB - slices_width * MAX_MBS_PER_SLICE];
+        uvec3 base = uvec3(0u, table.x, table.x + table.y);
+        slice_base.x = (MAX_MBS_PER_SLICE * slices_width + base[edge_slice]) * mb_width;
+        mbs_per_slice = table[edge_slice];
+    }
+
+    uvec2 mb_base = slice_base + uvec2(macroblock * mb_width, 0u);
+    uvec2 block_coord = plane != 0 ? uvec2(block >> 1u, block & 1u)
+                                   : uvec2(block & 1u, block >> 1u);
+    ivec2 coord = ivec2(mb_base + block_coord * 8u + uvec2(0u, row));
+    coord.y = coord.y * PICTURES_PER_FRAME + line_add;
+    coord = min(coord, imageSize(planes[plane]) - ivec2(1));
+
+    for (int i = 0; i < 8; i++) {
+        float c = imageLoad(planes[plane], coord + ivec2(i, 0)).x * 65535.0;
+        blocks[slice_block][row * 9u + uint(i)] = c / float(1 << (bits_per_sample - 1));
+    }
+
+    fdct8(slice_block, row, 9);
+    barrier();
+
+    fdct8(slice_block, row * 9u, 1);
+    barrier();
+
+    uint slice_row = slice_block * 8u + row;
+    uint blocks_per_slice = mbs_per_slice * BLOCKS_PER_MB;
+
+    i16vec4 dst_low;
+    dst_low.x = get_swizzled_coeff(blocks_per_slice, slice_row, 0);
+    dst_low.y = get_swizzled_coeff(blocks_per_slice, slice_row, 1);
+    dst_low.z = get_swizzled_coeff(blocks_per_slice, slice_row, 2);
+    dst_low.w = get_swizzled_coeff(blocks_per_slice, slice_row, 3);
+
+    i16vec4 dst_hi;
+    dst_hi.x = get_swizzled_coeff(blocks_per_slice, slice_row, 4);
+    dst_hi.y = get_swizzled_coeff(blocks_per_slice, slice_row, 5);
+    dst_hi.z = get_swizzled_coeff(blocks_per_slice, slice_row, 6);
+    dst_hi.w = get_swizzled_coeff(blocks_per_slice, slice_row, 7);
+
+    slices[slice].mbs_per_slice = mbs_per_slice;
+    slices[slice].coeffs[plane][slice_row * 8u + 0u] = dst_low.x;
+    slices[slice].coeffs[plane][slice_row * 8u + 1u] = dst_low.y;
+    slices[slice].coeffs[plane][slice_row * 8u + 2u] = dst_low.z;
+    slices[slice].coeffs[plane][slice_row * 8u + 3u] = dst_low.w;
+    slices[slice].coeffs[plane][slice_row * 8u + 4u] = dst_hi.x;
+    slices[slice].coeffs[plane][slice_row * 8u + 5u] = dst_hi.y;
+    slices[slice].coeffs[plane][slice_row * 8u + 6u] = dst_hi.z;
+    slices[slice].coeffs[plane][slice_row * 8u + 7u] = dst_hi.w;
+}

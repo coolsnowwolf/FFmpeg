@@ -1,0 +1,55 @@
+/*
+ * This file is part of FFmpeg.
+ */
+
+#ifndef DCT_NB_BLOCKS
+#define DCT_NB_BLOCKS 1
+#endif
+
+shared float blocks[DCT_NB_BLOCKS][8 * (8 + 1)];
+
+void fdct8(uint block, uint offset, uint stride)
+{
+    const float c_pi = radians(180.0);
+    const float c_rt2 = sqrt(2.0);
+    const float c_norm = 1.0 / sqrt(8.0);
+    const float c_a = c_rt2 * cos(c_pi / 16.0);
+    const float c_b = c_rt2 * cos(c_pi / 8.0);
+    const float c_c = c_rt2 * cos(3.0 * c_pi / 16.0);
+    const float c_d = c_rt2 * cos(5.0 * c_pi / 16.0);
+    const float c_e = c_rt2 * cos(3.0 * c_pi / 8.0);
+    const float c_f = c_rt2 * cos(7.0 * c_pi / 16.0);
+
+    float u0 = blocks[block][0 * stride + offset];
+    float u1 = blocks[block][1 * stride + offset];
+    float u2 = blocks[block][2 * stride + offset];
+    float u3 = blocks[block][3 * stride + offset];
+    float u4 = blocks[block][4 * stride + offset];
+    float u5 = blocks[block][5 * stride + offset];
+    float u6 = blocks[block][6 * stride + offset];
+    float u7 = blocks[block][7 * stride + offset];
+
+    float x07p = u0 + u7;
+    float x16p = u1 + u6;
+    float x25p = u2 + u5;
+    float x34p = u3 + u4;
+
+    float x07m = u0 - u7;
+    float x61m = u6 - u1;
+    float x25m = u2 - u5;
+    float x43m = u4 - u3;
+
+    float x07p34pp = x07p + x34p;
+    float x07p34pm = x07p - x34p;
+    float x16p25pp = x16p + x25p;
+    float x16p25pm = x16p - x25p;
+
+    blocks[block][0 * stride + offset] = c_norm * (x07p34pp + x16p25pp);
+    blocks[block][2 * stride + offset] = c_norm * (c_b * x07p34pm + c_e * x16p25pm);
+    blocks[block][4 * stride + offset] = c_norm * (x07p34pp - x16p25pp);
+    blocks[block][6 * stride + offset] = c_norm * (c_e * x07p34pm - c_b * x16p25pm);
+    blocks[block][1 * stride + offset] = c_norm * (c_a * x07m - c_c * x61m + c_d * x25m - c_f * x43m);
+    blocks[block][3 * stride + offset] = c_norm * (c_c * x07m + c_f * x61m - c_a * x25m + c_d * x43m);
+    blocks[block][5 * stride + offset] = c_norm * (c_d * x07m + c_a * x61m + c_f * x25m - c_c * x43m);
+    blocks[block][7 * stride + offset] = c_norm * (c_f * x07m + c_d * x61m + c_c * x25m + c_a * x43m);
+}
